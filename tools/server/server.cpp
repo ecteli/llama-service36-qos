@@ -154,6 +154,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+
+        if (params.qos_strict && params.qos_realtime_slot >= params.n_parallel) {
+            SRV_ERR("qos realtime slot %d is outside the configured slot range [0, %d)\n", params.qos_realtime_slot, params.n_parallel);
+            return 1;
+        }
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias

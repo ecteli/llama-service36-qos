@@ -1560,6 +1560,12 @@ json server_task_result_metrics::to_json() {
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
 
+        { "n_qos_preemptions_total",          n_qos_preemptions_total },
+        { "n_qos_background_pauses_total",     n_qos_background_pauses_total },
+        { "t_qos_background_paused_total",     t_qos_background_paused_total },
+        { "qos_realtime_slot",                 qos_realtime_slot },
+        { "qos_enabled",                       qos_enabled },
+
         { "n_draft_tokens_total",            n_draft_tokens_total },
         { "n_draft_accepted_total",          n_draft_accepted_total },
         { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
@@ -1661,12 +1667,50 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+size_t server_prompt_cache::realtime_size() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (state.cache_priority == SERVER_PROMPT_CACHE_PRIORITY_REALTIME) {
+            res += state.size();
+        }
+    }
+
+    return res;
+}
+
+bool server_prompt_cache::is_realtime_slot(int32_t slot_id) const {
+    return realtime_slot_id >= 0 && slot_id == realtime_slot_id;
+}
+
+bool server_prompt_cache::is_evictable(const server_prompt_cache_state & state) const {
+    return state.cache_priority != SERVER_PROMPT_CACHE_PRIORITY_REALTIME;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_oldest_normal() {
+    return std::find_if(states.begin(), states.end(), [this](const auto & state) {
+        return is_evictable(state);
+    });
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, int32_t owner_slot) {
+    const int32_t cache_priority = is_realtime_slot(owner_slot)
+        ? SERVER_PROMPT_CACHE_PRIORITY_REALTIME
+        : SERVER_PROMPT_CACHE_PRIORITY_NORMAL;
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
+            // An exact realtime re-save upgrades an existing normal entry. A
+            // longer background entry is intentionally not re-owned by the
+            // realtime slot because it may contain background-only suffixes.
+            if (is_realtime_slot(owner_slot)
+                    && it->prompt.tokens.size() == prompt.tokens.size()) {
+                it->owner_slot = owner_slot;
+                it->cache_priority = SERVER_PROMPT_CACHE_PRIORITY_REALTIME;
+            }
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1691,7 +1735,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size()
+                && (it->cache_priority != SERVER_PROMPT_CACHE_PRIORITY_REALTIME || is_realtime_slot(owner_slot))) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1700,13 +1745,27 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    if (cache_priority == SERVER_PROMPT_CACHE_PRIORITY_REALTIME
+            && realtime_limit_size > 0
+            && realtime_size() + state_size_new > realtime_limit_size) {
+        SRV_WRN(" - realtime prompt cache admission rejected: protected limit %.3f MiB would be exceeded (current %.3f MiB, requested %.3f MiB)\n",
+                realtime_limit_size / (1024.0 * 1024.0), realtime_size() / (1024.0 * 1024.0), state_size_new / (1024.0 * 1024.0));
+        return nullptr;
+    }
+
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+            auto it_evict = find_oldest_normal();
+            if (it_evict == states.end()) {
+                SRV_WRN(" - prompt cache admission rejected: only realtime entries remain (requested owner_slot = %d)\n", owner_slot);
+                return nullptr;
+            }
 
-            states.pop_front();
+            SRV_WRN(" - making room for prompt cache entry, removing oldest normal entry (owner_slot = %d, size = %.3f MiB)\n",
+                    it_evict->owner_slot, it_evict->size() / (1024.0 * 1024.0));
+
+            states.erase(it_evict);
         }
     }
 
@@ -1738,6 +1797,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.owner_slot     =*/ owner_slot,
+        /*.cache_priority =*/ cache_priority,
     });
 
     return &states.back();
@@ -1778,6 +1839,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        const bool retain_entry = it_best->cache_priority == SERVER_PROMPT_CACHE_PRIORITY_REALTIME;
+
         {
             auto & data = it_best->data.main;
 
@@ -1789,8 +1852,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!retain_entry) {
+                data.clear();
+                data.shrink_to_fit();
+            }
         }
 
         {
@@ -1807,14 +1872,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (!retain_entry) {
+                    data.clear();
+                    data.shrink_to_fit();
+                }
             }
         }
 
         prompt = std::move(it_best->prompt);
 
-        states.erase(it_best);
+        if (!retain_entry) {
+            states.erase(it_best);
+        } else {
+            SRV_TRC("%s", " - retaining realtime prompt-cache entry after restore\n");
+        }
     }
 
     return true;
@@ -1823,9 +1894,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            auto it_evict = find_oldest_normal();
+            if (it_evict == states.end()) {
+                SRV_WRN("%s", " - prompt cache size limit retained: only realtime entries remain\n");
+                break;
+            }
 
-            states.pop_front();
+            SRV_WRN(" - cache size limit reached, removing oldest normal entry (owner_slot = %d, size = %.3f MiB)\n",
+                    it_evict->owner_slot, it_evict->size() / (1024.0 * 1024.0));
+
+            states.erase(it_evict);
         }
     }
 
@@ -1837,10 +1915,16 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            auto it_evict = find_oldest_normal();
+            if (it_evict == states.end()) {
+                SRV_WRN("%s", " - prompt cache token limit retained: only realtime entries remain\n");
+                break;
+            }
 
-            states.pop_front();
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest normal entry (owner_slot = %d, size = %.3f MiB)\n",
+                    limit_tokens, limit_tokens_cur, it_evict->owner_slot, it_evict->size() / (1024.0 * 1024.0));
+
+            states.erase(it_evict);
         }
     }
 
@@ -1848,7 +1932,8 @@ void server_prompt_cache::update() {
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, owner_slot: %2d, priority: %d, checkpoints: %2zu, %9.3f MiB\n",
+                (const void *)&state, state.prompt.n_tokens(), state.owner_slot, state.cache_priority,
+                state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }

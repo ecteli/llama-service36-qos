@@ -25,6 +25,7 @@ def create_server():
     server.temperature = 0.0
     server.server_slots = True
     server.cache_ram = 100
+    server.cache_realtime_ram = 100
     server.kv_unified = True
     server.debug = True
     fd, server.log_path = tempfile.mkstemp(suffix='.log')
@@ -79,6 +80,7 @@ def test_clear_and_restore():
     assert "updating prompt cache" in log.drain()
     assert res.body["timings"]["cache_n"] > 0
     assert res.body["timings"]["prompt_n"] < original_prompt_n
+    assert "retaining realtime prompt-cache entry after restore" in log.drain()
 
     # Follow-up — slot 0 kept its KV, no clearing needed
     res = server.make_request("POST", "/completion", data={

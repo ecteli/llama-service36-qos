@@ -38,6 +38,7 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+constexpr int BACKGROUND_PREFILL_QUANTUM = 512;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -265,7 +266,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, id);
         if (cur == nullptr) {
             return false;
         }
@@ -839,6 +840,11 @@ struct server_metrics {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    uint64_t n_qos_preemptions_total      = 0;
+    uint64_t n_qos_background_pauses_total = 0;
+    uint64_t t_qos_background_paused_us_total = 0;
+    int64_t  t_qos_background_pause_start     = 0;
+
     uint64_t n_draft_tokens_total      = 0;
     uint64_t n_draft_accepted_total    = 0;
     uint64_t n_draft_verif_steps_total = 0;
@@ -883,6 +889,30 @@ struct server_metrics {
             }
             n_tokens_max = std::max(n_tokens_max, (uint64_t) slot.prompt.n_tokens());
         }
+    }
+
+    void on_qos_preemption() {
+        n_qos_preemptions_total++;
+    }
+
+    void on_qos_background_pause() {
+        n_qos_background_pauses_total++;
+        t_qos_background_pause_start = ggml_time_us();
+    }
+
+    void on_qos_background_resume() {
+        if (t_qos_background_pause_start != 0) {
+            t_qos_background_paused_us_total += ggml_time_us() - t_qos_background_pause_start;
+            t_qos_background_pause_start = 0;
+        }
+    }
+
+    uint64_t qos_background_paused_us() const {
+        uint64_t result = t_qos_background_paused_us_total;
+        if (t_qos_background_pause_start != 0) {
+            result += ggml_time_us() - t_qos_background_pause_start;
+        }
+        return result;
     }
 
     void reset_bucket() {
@@ -967,6 +997,8 @@ private:
     int trace = 0;
     int slots_debug = 0;
     int n_empty_consecutive = 0;
+    bool qos_strict_active = false;
+    bool qos_background_paused_active = false;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -1406,7 +1438,8 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                params_base.cache_ram_mib, n_ctx, params_base.qos_realtime_slot, params_base.cache_realtime_ram_mib);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -2547,6 +2580,12 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    res->n_qos_preemptions_total         = metrics.n_qos_preemptions_total;
+                    res->n_qos_background_pauses_total    = metrics.n_qos_background_pauses_total;
+                    res->t_qos_background_paused_total    = metrics.qos_background_paused_us();
+                    res->qos_realtime_slot                = params_base.qos_realtime_slot;
+                    res->qos_enabled                      = params_base.qos_strict;
+
                     res->n_draft_tokens_total      = metrics.n_draft_tokens_total;
                     res->n_draft_accepted_total    = metrics.n_draft_accepted_total;
                     res->n_draft_verif_steps_total = metrics.n_draft_verif_steps_total;
@@ -2829,6 +2868,8 @@ private:
             }
 
             if (all_idle) {
+                update_qos_state(false, false);
+
                 SRV_TRC("%s", "all slots are idle\n");
                 return; // skip further processing
 
@@ -2913,10 +2954,51 @@ private:
         }
     }
 
+    void update_qos_state(bool strict, bool background_paused) {
+        if (strict != qos_strict_active) {
+            if (strict) {
+                SRV_INF("QOS STRICT enter: slot %d active, background compute paused\n", params_base.qos_realtime_slot);
+                metrics.on_qos_preemption();
+            } else {
+                SRV_INF("QOS STRICT exit: slot %d idle, background resumed\n", params_base.qos_realtime_slot);
+            }
+            qos_strict_active = strict;
+        }
+
+        if (background_paused != qos_background_paused_active) {
+            if (background_paused) {
+                metrics.on_qos_background_pause();
+            } else {
+                metrics.on_qos_background_resume();
+            }
+            qos_background_paused_active = background_paused;
+        }
+    }
+
     void pre_decode() {
+        const auto * realtime_slot = params_base.qos_strict ? get_slot_by_id(params_base.qos_realtime_slot) : nullptr;
+        const bool qos_strict = realtime_slot && realtime_slot->is_processing() && !realtime_slot->task->is_child();
+
+        auto background_paused = [&](const server_slot & slot) {
+            if (!qos_strict || slot.id == params_base.qos_realtime_slot) {
+                return false;
+            }
+
+            return !slot.task || !slot.task->is_child() || slot.task->id_parent != realtime_slot->task->id;
+        };
+
+        const bool qos_background_paused = std::any_of(slots.begin(), slots.end(), [&](const server_slot & slot) {
+            return slot.is_processing() && background_paused(slot);
+        });
+        update_qos_state(qos_strict, qos_background_paused);
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
+            if (background_paused(slot)) {
+                return;
+            }
+
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
@@ -2993,6 +3075,14 @@ private:
                 return;
             }
 
+            if (spec) {
+                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+            }
+
+            if (background_paused(slot)) {
+                return;
+            }
+
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -3003,8 +3093,6 @@ private:
             generating.push_back(&slot);
 
             if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
-
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
@@ -3122,6 +3210,10 @@ private:
                 }
 
                 if (!slot.is_processing()) {
+                    return;
+                }
+
+                if (background_paused(slot)) {
                     return;
                 }
 
@@ -3511,9 +3603,15 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+                    const int32_t prompt_quantum =
+                        params_base.qos_strict && slot.id != params_base.qos_realtime_slot && slot.can_split()
+                            ? BACKGROUND_PREFILL_QUANTUM
+                            : n_batch;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                           batch.size() < n_batch &&
+                           batch.size() - n_tokens_prev < prompt_quantum) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4466,6 +4564,18 @@ void server_routes::init_routes() {
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
             }, {
+                    {"name",  "qos_preemptions_total"},
+                    {"help",  "Number of strict QoS priority activations."},
+                    {"value",  res_task->n_qos_preemptions_total}
+            }, {
+                    {"name",  "qos_background_pauses_total"},
+                    {"help",  "Number of background compute pause intervals."},
+                    {"value",  res_task->n_qos_background_pauses_total}
+            }, {
+                    {"name",  "qos_background_paused_seconds"},
+                    {"help",  "Total time background compute was paused in seconds."},
+                    {"value",  res_task->t_qos_background_paused_total / 1.e6}
+            }, {
                     {"name",  "spec_decode_num_draft_tokens_total"},
                     {"help",  "Total draft tokens generated"},
                     {"value",  res_task->n_draft_tokens_total}
@@ -4498,6 +4608,14 @@ void server_routes::init_routes() {
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
+            },{
+                    {"name",  "qos_realtime_slot"},
+                    {"help",  "Slot ID configured for strict QoS priority."},
+                    {"value",  res_task->qos_realtime_slot}
+            },{
+                    {"name",  "qos_enabled"},
+                    {"help",  "Whether strict QoS scheduling is enabled."},
+                    {"value",  res_task->qos_enabled ? 1 : 0}
             }}}
         };
 

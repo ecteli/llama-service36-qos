@@ -532,6 +532,12 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    uint64_t n_qos_preemptions_total             = 0;
+    uint64_t n_qos_background_pauses_total        = 0;
+    uint64_t t_qos_background_paused_total        = 0;
+    int32_t  qos_realtime_slot                    = 0;
+    bool     qos_enabled                          = false;
+
     uint64_t n_draft_tokens_total      = 0;
     uint64_t n_draft_accepted_total    = 0;
     uint64_t n_draft_verif_steps_total = 0;
@@ -620,9 +626,16 @@ struct server_prompt_data {
     }
 };
 
+enum server_prompt_cache_priority {
+    SERVER_PROMPT_CACHE_PRIORITY_NORMAL = 0,
+    SERVER_PROMPT_CACHE_PRIORITY_REALTIME = 1,
+};
+
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    int32_t owner_slot = -1;
+    int32_t cache_priority = SERVER_PROMPT_CACHE_PRIORITY_NORMAL;
 
     size_t size() const {
         size_t res = data.size();
@@ -636,9 +649,11 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t realtime_slot_id, int32_t realtime_limit_size_mib) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->realtime_slot_id = realtime_slot_id;
+        this->realtime_limit_size = 1024ull*1024ull*(realtime_limit_size_mib > 0 ? realtime_limit_size_mib : 0);
     }
 
     std::list<server_prompt_cache_state> states;
@@ -649,15 +664,28 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // Slot whose prompt-cache entries are protected from background eviction.
+    int32_t realtime_slot_id = -1;
+
+    // in bytes, 0 = no separate protected-cache limit
+    size_t realtime_limit_size = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    size_t realtime_size() const;
+
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, int32_t owner_slot);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+private:
+    bool is_realtime_slot(int32_t slot_id) const;
+    bool is_evictable(const server_prompt_cache_state & state) const;
+    std::list<server_prompt_cache_state>::iterator find_oldest_normal();
 };
 
 // used exclusively by router mode
