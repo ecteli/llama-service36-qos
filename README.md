@@ -1,3 +1,38 @@
+# Service36 llama.cpp QoS build
+
+This repository is the Service36 fork of `llama.cpp` for a two-slot Qwen3.6 runtime:
+
+- slot 0: Service36 Bot realtime requests;
+- slot 1: OpenCode, OpenClaw, and other background work;
+- strict scheduler priority: `--qos-strict --qos-realtime-slot 0`;
+- non-unified KV: `--parallel 2 --no-kv-unified`;
+- protected host prompt cache for realtime LCP reuse.
+
+The local Service36 provider must send `id_slot: 0` on every bot request. Background clients must use `id_slot: 1`; do not use automatic slot selection.
+
+## Prompt-cache policy
+
+`--cache-ram` is the global host-RAM prompt-cache limit. `--cache-realtime-ram` is a protected sub-limit within it, not an additional allocation and not VRAM.
+
+```text
+--cache-ram 4096 --cache-realtime-ram 2048
+```
+
+Prompt-cache entries from the realtime slot are retained under slot-1 cache pressure. Normal entries are evicted first. A request whose entry cannot be admitted still completes without caching.
+
+On the production Qwen3.6 GPU profile, a 2,408-token stable prompt replayed after slot-1 pressure restored 2,404 cached tokens: prompt prefill fell from 4.70 s to 131 ms.
+
+See [Service36 strict QoS documentation](docs/SERVICE36_STRICT_QOS.md) for the operational contract, cache policy, and metrics.
+
+## Build
+
+```sh
+cmake -S . -B build-production-qos-final -G Ninja -DGGML_CUDA=ON
+ninja -C build-production-qos-final -j6 llama-server
+```
+
+The remainder of this README is the upstream llama.cpp documentation.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
